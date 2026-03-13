@@ -1,0 +1,7 @@
+# temp files(e.g. test,analyze ...)
+temp/
+tmp/
+
+# AI
+.claude/
+.mcp.json

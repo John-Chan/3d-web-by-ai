@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GL_MART 图形超市 - 3D Receipt</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #f5f5f5; overflow: hidden; }
+  canvas { display: block; }
+  #hint {
+    position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+    color: #aaa; font-size: 13px; font-family: "Courier New", monospace;
+    pointer-events: none; user-select: none;
+    background: rgba(255,255,255,0.8); padding: 6px 16px; border-radius: 4px;
+  }
+</style>
+</head>
+<body>
+<div id="hint">左键拖拽小票 · 右键旋转视角 · 滚轮缩放</div>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.163.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.163.0/examples/jsm/"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ==================== 配置 ====================
+const COLS = 16;
+const ROWS = 40;
+const WIDTH = 3.2;
+const HEIGHT = 8.0;
+const DAMPING = 0.97;
+const GRAVITY = 0.012;
+const CONSTRAINT_ITERS = 15;
+const SUB_STEPS = 2;
+const GRAB_RADIUS = 0.65;
+const WIND_AMP = 0.0008;
+
+// ==================== 渲染器 ====================
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.1;
+document.body.appendChild(renderer.domElement);
+
+// ==================== 场景 ====================
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xf2f2f2);
+
+const camera = new THREE.PerspectiveCamera(40, innerWidth / innerHeight, 0.1, 100);
+camera.position.set(0, -2, 12);
+
+const orbit = new OrbitControls(camera, renderer.domElement);
+orbit.enableDamping = true;
+orbit.dampingFactor = 0.08;
+orbit.target.set(0, -3, 0);
+
+// ==================== 灯光 ====================
+scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+
+const mainLight = new THREE.DirectionalLight(0xffffff, 1.0);
+mainLight.position.set(4, 6, 8);
+mainLight.castShadow = true;
+mainLight.shadow.mapSize.set(1024, 1024);
+mainLight.shadow.bias = -0.001;
+const sc = mainLight.shadow.camera;
+sc.left = -6; sc.right = 6; sc.top = 4; sc.bottom = -12;
+scene.add(mainLight);
+
+scene.add(new THREE.DirectionalLight(0xffffff, 0.25).translateX(-3).translateY(2).translateZ(4));
+
+// 接收阴影的背景墙
+const wallMat = new THREE.ShadowMaterial({ opacity: 0.1 });
+const wall = new THREE.Mesh(new THREE.PlaneGeometry(20, 20), wallMat);
+wall.position.set(0, -3, -1.5);
+wall.receiveShadow = true;
+scene.add(wall);
+
+// ==================== 小票纹理（Canvas 2D）====================
+function createReceiptTexture() {
+  const W = 512, H = 1280;
+  const cv = document.createElement('canvas');
+  cv.width = W; cv.height = H;
+  const c = cv.getContext('2d');
+
+  // 热敏纸底色
+  c.fillStyle = '#faf7f0';
+  c.fillRect(0, 0, W, H);
+
+  // 纸张噪点
+  const id = c.getImageData(0, 0, W, H);
+  for (let i = 0; i < id.data.length; i += 4) {
+    const n = (Math.random() - 0.5) * 10;
+    id.data[i] += n; id.data[i+1] += n; id.data[i+2] += n;
+  }
+  c.putImageData(id, 0, 0);
+
+  // 热敏纸横纹
+  c.strokeStyle = 'rgba(200,190,170,0.12)';
+  c.lineWidth = 1;
+  for (let y = 0; y < H; y += 3) {
+    if (Math.random() > 0.55) {
+      c.beginPath(); c.moveTo(0, y); c.lineTo(W, y); c.stroke();
+    }
+  }
+
+  const cx = W / 2, L = 38, R = W - 38;
+  let y = 55;
+
+  const text = (t, sz, col, align, bold) => {
+    c.fillStyle = col || '#1a1a1a';
+    c.font = (bold ? 'bold ' : '') + sz + 'px "Courier New", "Microsoft YaHei", monospace';
+    c.textAlign = align || 'center';
+    c.fillText(t, align === 'left' ? L : align === 'right' ? R : cx, y);
+  };
+  const sep = () => { text('\u2501'.repeat(24), 14, '#999'); y += 22; };
+  const thin = () => { text('\u2500'.repeat(28), 13, '#bbb'); y += 20; };
+
+  // 店名
+  text('\uD83D\uDED2 GL_MART', 32, '#1a1a1a', 'center', true); y += 32;
+  text('\u56FE \u5F62 \u8D85 \u5E02', 20, '#444'); y += 28;
+  text('\u60A8\u7684\u6E32\u67D3\u7BA1\u7EBF\u4E13\u5BB6', 15, '#888'); y += 28;
+  sep();
+
+  text('\u65E5\u671F: 2026-03-13 14:23:07', 14, '#555', 'left'); y += 20;
+  text('\u6536\u94F6\u5458: Fragment Shader #7', 14, '#555', 'left'); y += 20;
+  text('\u5DE5\u4F4D: GPU Core 0x3F', 14, '#555', 'left'); y += 20;
+  text('\u4F1A\u5458: Texture2D \u5C0A\u4EAB\u5361', 14, '#555', 'left'); y += 26;
+  sep();
+
+  text('\u5546 \u54C1 \u6E05 \u5355', 18, '#1a1a1a', 'center', true); y += 26;
+  thin();
+
+  const items = [
+    ['\u6CD5\u7EBF\u8D34\u56FE(\u52A0\u51F9\u51F8)',    '\xA542.00'],
+    ['\u9876\u70B9\u7F13\u51B2\u533A 1kg\u88C5',        '\xA515.50'],
+    ['UV\u5C55\u5F00\u670D\u52A1(\u542B\u71E8\u70EB)',  '\xA5666.00'],
+    ['\u6297\u952F\u9F7F\u9762\u971C SPF50',             '\xA58.99'],
+    ['\u73AF\u5883\u5149\u906E\u853D\u55B7\u96FE',       '\xA523.99'],
+    ['Mipmap\u5168\u5957(0-12\u7EA7)',                    '\xA5128.00'],
+    ['\u5149\u7EBF\u8FFD\u8E2A\u6708\u5361(\u221E\u6708)','\xA5\u221E'],
+    ['\u6CDB\u5149\u6EE4\u955C(\u52A0\u4EAE)',           '\xA533.33'],
+    ['\u5EF6\u8FDF\u6E32\u67D3\u5DE5\u5177\u5305',       '\xA577.77'],
+    ['\u7247\u5143\u7740\u8272\u5668 x1',                '\xA5999.99'],
+  ];
+
+  c.font = '15px "Courier New", "Microsoft YaHei", monospace';
+  for (const [name, price] of items) {
+    c.fillStyle = '#222'; c.textAlign = 'left';
+    c.fillText(name, L, y);
+    c.textAlign = 'right';
+    c.fillText(price, R, y);
+    y += 26;
+  }
+
+  y += 8; thin();
+
+  c.font = '15px "Courier New", "Microsoft YaHei", monospace';
+  c.fillStyle = '#333'; c.textAlign = 'left';
+  c.fillText('\u5C0F\u8BA1:', L, y);
+  c.textAlign = 'right'; c.fillText('\xA51,995.57', R, y); y += 24;
+
+  c.fillStyle = '#888'; c.textAlign = 'left';
+  c.fillText('\u7A0E(GPU\u6E29\u5EA6\u6298\u6263):', L, y);
+  c.textAlign = 'right'; c.fillText('-\xA569.42', R, y); y += 28;
+  sep();
+
+  c.fillStyle = '#000';
+  c.font = 'bold 20px "Courier New", "Microsoft YaHei", monospace';
+  c.textAlign = 'center';
+  c.fillText('\u603B\u8BA1: \xA51,926.15', cx, y); y += 32;
+  sep();
+
+  c.fillStyle = '#666'; c.font = '14px "Courier New", monospace';
+  c.fillText('\u652F\u4ED8: WebGL Context', cx, y); y += 20;
+  c.fillText('\u5361\u53F7: **** **** **** GLSL', cx, y); y += 32;
+
+  c.fillStyle = '#333'; c.font = '16px "Courier New", "Microsoft YaHei", monospace';
+  c.fillText('\u2014 \u611F\u8C22\u5149\u4E34\uFF01\u2014', cx, y); y += 24;
+
+  c.fillStyle = '#888'; c.font = '13px "Courier New", monospace';
+  c.fillText('May your FPS be high', cx, y); y += 18;
+  c.fillText('and your draw calls be low', cx, y); y += 32;
+
+  // 条形码
+  c.fillStyle = '#222';
+  const bw = 280, bx0 = (W - bw) / 2;
+  for (let i = 0; i < 70; i++) {
+    const w = Math.random() > 0.5 ? 2 : 3;
+    const bx = bx0 + i * 4;
+    if (bx + w > bx0 + bw) break;
+    c.fillRect(bx, y, w, 35);
+  }
+  y += 42;
+  c.fillStyle = '#555'; c.font = '12px "Courier New", monospace';
+  c.textAlign = 'center';
+  c.fillText('3 1415 92653 58979 3', cx, y);
+
+  // 底部撕裂边缘
+  c.globalCompositeOperation = 'destination-out';
+  c.beginPath();
+  c.moveTo(0, H - 18);
+  for (let x = 0; x <= W; x += 3) {
+    c.lineTo(x, H - 18 + Math.random() * 16 + Math.sin(x * 0.08) * 4);
+  }
+  c.lineTo(W, H + 1); c.lineTo(0, H + 1);
+  c.closePath(); c.fill();
+  c.globalCompositeOperation = 'source-over';
+
+  const tex = new THREE.CanvasTexture(cv);
+  tex.minFilter = THREE.LinearMipmapLinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  return tex;
+}
+
+// ==================== Verlet 粒子模拟 ====================
+class ReceiptSim {
+  constructor() {
+    this.particles = [];
+    this.constraints = [];
+    const x0 = -WIDTH / 2;
+
+    for (let r = 0; r < ROWS; r++) {
+      for (let cl = 0; cl < COLS; cl++) {
+        const x = x0 + (cl / (COLS - 1)) * WIDTH;
+        const y = -(r / (ROWS - 1)) * HEIGHT;
+        const curl = r > ROWS * 0.75 ? ((r - ROWS * 0.75) / (ROWS * 0.25)) ** 2 * 0.15 : 0;
+        this.particles.push({
+          x, y, z: curl,
+          px: x, py: y, pz: curl,
+          pinned: r === 0,  // 整行固定！
+          grabbed: false,
+          rx: x, ry: y, rz: 0,
+        });
+      }
+    }
+
+    const addC = (i1, i2, stiff) => {
+      const a = this.particles[i1], b = this.particles[i2];
+      const dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
+      this.constraints.push({ i1, i2, rest: Math.sqrt(dx*dx + dy*dy + dz*dz), stiff });
+    };
+
+    for (let r = 0; r < ROWS; r++) {
+      for (let cl = 0; cl < COLS; cl++) {
+        const i = r * COLS + cl;
+        if (cl < COLS - 1) addC(i, i + 1, 1.0);       // 结构-水平
+        if (r < ROWS - 1)  addC(i, i + COLS, 1.0);     // 结构-垂直
+        if (cl < COLS - 1 && r < ROWS - 1) addC(i, i + COLS + 1, 0.7); // 剪切
+        if (cl > 0 && r < ROWS - 1)        addC(i, i + COLS - 1, 0.7); // 剪切
+        if (cl < COLS - 2) addC(i, i + 2, 0.4);            // 弯曲-水平
+        if (r < ROWS - 2)  addC(i, i + COLS * 2, 0.4);     // 弯曲-垂直
+      }
+    }
+  }
+
+  step(wx, wz) {
+    const ps = this.particles;
+
+    // Verlet 积分
+    for (let i = 0; i < ps.length; i++) {
+      const p = ps[i];
+      if (p.pinned) { p.x = p.rx; p.y = p.ry; p.z = p.rz; continue; }
+      if (p.grabbed) continue;
+
+      const vx = (p.x - p.px) * DAMPING;
+      const vy = (p.y - p.py) * DAMPING;
+      const vz = (p.z - p.pz) * DAMPING;
+
+      p.px = p.x; p.py = p.y; p.pz = p.z;
+      p.x += vx + (wx || 0);
+      p.y += vy - GRAVITY;
+      p.z += vz + (wz || 0);
+    }
+
+    // 约束求解（Gauss-Seidel）
+    const cs = this.constraints;
+    for (let iter = 0; iter < CONSTRAINT_ITERS; iter++) {
+      for (let i = 0; i < cs.length; i++) {
+        const cn = cs[i];
+        const a = ps[cn.i1], b = ps[cn.i2];
+        let dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
+        const dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+        if (dist < 1e-7) continue;
+        const diff = (dist - cn.rest) / dist * cn.stiff * 0.5;
+        dx *= diff; dy *= diff; dz *= diff;
+
+        if (!a.pinned && !a.grabbed) { a.x += dx; a.y += dy; a.z += dz; }
+        if (!b.pinned && !b.grabbed) { b.x -= dx; b.y -= dy; b.z -= dz; }
+      }
+    }
+  }
+}
+
+const sim = new ReceiptSim();
+
+// ==================== 网格 ====================
+const geo = new THREE.BufferGeometry();
+const numV = COLS * ROWS;
+const posArr = new Float32Array(numV * 3);
+const uvArr = new Float32Array(numV * 2);
+const indices = [];
+
+for (let r = 0; r < ROWS; r++) {
+  for (let cl = 0; cl < COLS; cl++) {
+    const i = r * COLS + cl;
+    uvArr[i * 2] = cl / (COLS - 1);
+    uvArr[i * 2 + 1] = 1 - r / (ROWS - 1);
+  }
+}
+for (let r = 0; r < ROWS - 1; r++) {
+  for (let cl = 0; cl < COLS - 1; cl++) {
+    const a = r * COLS + cl;
+    indices.push(a, a + 1, a + COLS, a + 1, a + COLS + 1, a + COLS);
+  }
+}
+
+geo.setAttribute('position', new THREE.BufferAttribute(posArr, 3));
+geo.setAttribute('uv', new THREE.BufferAttribute(uvArr, 2));
+geo.setIndex(indices);
+
+const mat = new THREE.MeshStandardMaterial({
+  map: createReceiptTexture(),
+  side: THREE.DoubleSide,
+  roughness: 0.88,
+  metalness: 0.0,
+  transparent: true,
+  alphaTest: 0.4,
+});
+
+const mesh = new THREE.Mesh(geo, mat);
+mesh.castShadow = true;
+scene.add(mesh);
+
+// ==================== 鼠标交互 ====================
+const raycaster = new THREE.Raycaster();
+const mouseNDC = new THREE.Vector2();
+const dragPlane = new THREE.Plane();
+const hitPt = new THREE.Vector3();
+let dragging = false;
+let grabbed = [];
+
+renderer.domElement.addEventListener('mousedown', e => {
+  if (e.button !== 0) return;
+  mouseNDC.set((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
+  raycaster.setFromCamera(mouseNDC, camera);
+  const hits = raycaster.intersectObject(mesh);
+  if (!hits.length) return;
+
+  const pt = hits[0].point;
+  grabbed = [];
+  for (let i = 0; i < sim.particles.length; i++) {
+    const p = sim.particles[i];
+    if (p.pinned) continue;
+    const dx = p.x - pt.x, dy = p.y - pt.y, dz = p.z - pt.z;
+    const dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+    if (dist < GRAB_RADIUS) {
+      grabbed.push({ idx: i, ox: dx, oy: dy, oz: dz, w: 1 - dist / GRAB_RADIUS });
+      p.grabbed = true;
+    }
+  }
+
+  if (grabbed.length) {
+    dragging = true;
+    orbit.enabled = false;
+    renderer.domElement.style.cursor = 'grabbing';
+    const camDir = new THREE.Vector3();
+    camera.getWorldDirection(camDir);
+    dragPlane.setFromNormalAndCoplanarPoint(camDir, pt);
+  }
+});
+
+renderer.domElement.addEventListener('mousemove', e => {
+  mouseNDC.set((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
+
+  if (!dragging) {
+    raycaster.setFromCamera(mouseNDC, camera);
+    const h = raycaster.intersectObject(mesh);
+    renderer.domElement.style.cursor = h.length ? 'grab' : 'default';
+    return;
+  }
+
+  raycaster.setFromCamera(mouseNDC, camera);
+  if (raycaster.ray.intersectPlane(dragPlane, hitPt)) {
+    for (const g of grabbed) {
+      const p = sim.particles[g.idx];
+      const tx = hitPt.x + g.ox, ty = hitPt.y + g.oy, tz = hitPt.z + g.oz;
+      p.x += (tx - p.x) * g.w;
+      p.y += (ty - p.y) * g.w;
+      p.z += (tz - p.z) * g.w;
+      p.px = p.x; p.py = p.y; p.pz = p.z;
+    }
+  }
+});
+
+renderer.domElement.addEventListener('mouseup', () => {
+  if (!dragging) return;
+  for (const g of grabbed) sim.particles[g.idx].grabbed = false;
+  grabbed = [];
+  dragging = false;
+  orbit.enabled = true;
+  renderer.domElement.style.cursor = 'default';
+});
+
+// ==================== 动画循环 ====================
+let t = 0;
+function animate() {
+  requestAnimationFrame(animate);
+  t += 0.016;
+
+  const wx = Math.sin(t * 0.7) * WIND_AMP + Math.sin(t * 2.3) * WIND_AMP * 0.3;
+  const wz = Math.cos(t * 1.1) * WIND_AMP * 0.8;
+
+  for (let s = 0; s < SUB_STEPS; s++) {
+    sim.step(wx / SUB_STEPS, wz / SUB_STEPS);
+  }
+
+  const pos = geo.attributes.position;
+  for (let i = 0; i < sim.particles.length; i++) {
+    const p = sim.particles[i];
+    pos.array[i * 3] = p.x;
+    pos.array[i * 3 + 1] = p.y;
+    pos.array[i * 3 + 2] = p.z;
+  }
+  pos.needsUpdate = true;
+  geo.computeVertexNormals();
+
+  orbit.update();
+  renderer.render(scene, camera);
+}
+
+window.addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+animate();
+</script>
+</body>
+</html>

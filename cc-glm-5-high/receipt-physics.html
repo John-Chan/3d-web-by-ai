@@ -1,0 +1,846 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🎮 3D图形术语购物小票 - 物理模拟</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            width: 100vw;
+            height: 100vh;
+            overflow: hidden;
+            background: linear-gradient(135deg, #e8e8e8 0%, #d0d0d0 100%);
+            font-family: 'Courier New', monospace;
+        }
+        #container {
+            width: 100%;
+            height: 100%;
+        }
+        #info {
+            position: absolute;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(255, 255, 255, 0.95);
+            padding: 15px 25px;
+            border-radius: 8px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.15);
+            font-size: 14px;
+            color: #333;
+            text-align: center;
+            z-index: 100;
+        }
+        #info h3 {
+            margin-bottom: 8px;
+            color: #c0392b;
+        }
+        #stats {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            background: rgba(0, 0, 0, 0.7);
+            color: #0f0;
+            padding: 10px 15px;
+            border-radius: 5px;
+            font-size: 12px;
+            font-family: monospace;
+        }
+    </style>
+</head>
+<body>
+    <div id="info">
+        <h3>🖨️ GPU GRAPHICS 超市 - 小票打印机</h3>
+        <div>🖱️ 左键拖拽小票 | 右键旋转视角 | 滚轮缩放</div>
+    </div>
+    <div id="container"></div>
+    <div id="stats">FPS: --</div>
+
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+        }
+    }
+    </script>
+
+    <script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ============================================================
+// 配置参数 - 调整这些值来改变纸张行为
+// ============================================================
+const CONFIG = {
+    // 粒子网格大小
+    cols: 16,              // 宽度方向粒子数
+    rows: 28,              // 高度方向粒子数
+
+    // 物理尺寸
+    width: 2.8,            // 小票宽度
+    height: 4.5,           // 小票高度
+
+    // 物理模拟参数
+    gravity: -6.0,         // 重力加速度
+    damping: 0.97,         // 速度阻尼 (0.9-0.99)
+    subSteps: 16,          // 物理子步迭代次数
+
+    // 约束刚度
+    distanceStiffness: 0.9,  // 距离约束刚度
+    bendStiffness: 0.35,     // 弯曲约束刚度 (控制纸张柔软度)
+
+    // 顶部边缘强化 (关键：防止晾衣绳效果)
+    topRowsToStiffen: 3,     // 顶部增强区域行数
+    topEdgeMultiplier: 2.5,  // 顶部约束强度倍数
+
+    // 交互参数
+    interactionRadius: 0.6,  // 鼠标影响半径
+    pinDuration: 200,        // 松开后的惯性时长 (ms)
+};
+
+// ============================================================
+// 粒子类
+// ============================================================
+class Particle {
+    constructor(x, y, z, row) {
+        this.position = new THREE.Vector3(x, y, z);
+        this.previous = new THREE.Vector3(x, y, z);
+        this.acceleration = new THREE.Vector3();
+        this.invMass = 1.0;
+        this.row = row; // 记录所在行
+        this.pinned = row === 0; // 只固定最顶行
+    }
+
+    addForce(force) {
+        this.acceleration.addScaledVector(force, this.invMass);
+    }
+
+    integrate(dt) {
+        if (this.pinned) return;
+
+        // Verlet 积分
+        const velocity = new THREE.Vector3().subVectors(
+            this.position,
+            this.previous
+        ).multiplyScalar(CONFIG.damping);
+
+        this.previous.copy(this.position);
+        this.position.add(velocity);
+        this.position.addScaledVector(this.acceleration, dt * dt);
+
+        this.acceleration.set(0, 0, 0);
+    }
+}
+
+// ============================================================
+// 距离约束
+// ============================================================
+class DistanceConstraint {
+    constructor(p1, p2, stiffness, restLength = null) {
+        this.p1 = p1;
+        this.p2 = p2;
+        this.stiffness = stiffness;
+        this.restLength = restLength !== null
+            ? restLength
+            : p1.position.distanceTo(p2.position);
+    }
+
+    solve() {
+        const delta = new THREE.Vector3().subVectors(
+            this.p2.position,
+            this.p1.position
+        );
+        const currentLength = delta.length();
+
+        if (currentLength < 0.0001) return;
+
+        const error = (currentLength - this.restLength) / currentLength;
+        const correction = delta.multiplyScalar(error * this.stiffness * 0.5);
+
+        if (!this.p1.pinned) this.p1.position.add(correction);
+        if (!this.p2.pinned) this.p2.position.sub(correction);
+    }
+}
+
+// ============================================================
+// 小票物理系统
+// ============================================================
+class ReceiptPhysics {
+    constructor() {
+        this.particles = [];
+        this.constraints = [];
+        this.grid = new Map(); // 粒子网格索引
+
+        this.initParticles();
+        this.initConstraints();
+    }
+
+    initParticles() {
+        const { cols, rows, width, height } = CONFIG;
+        const cellW = width / (cols - 1);
+        const cellH = height / (rows - 1);
+
+        for (let r = 0; r < rows; r++) {
+            for (let c = 0; c < cols; c++) {
+                const x = -width / 2 + c * cellW;
+                const y = 2.5 - r * cellH; // 从顶部开始
+                const z = 0;
+
+                const particle = new Particle(x, y, z, r);
+                this.particles.push(particle);
+                this.grid.set(`${r}-${c}`, particle);
+            }
+        }
+    }
+
+    initConstraints() {
+        const { cols, rows } = CONFIG;
+        const getStiffness = (row) => {
+            // 顶部区域使用更强的约束
+            if (row < CONFIG.topRowsToStiffen) {
+                return CONFIG.distanceStiffness * CONFIG.topEdgeMultiplier;
+            }
+            return CONFIG.distanceStiffness;
+        };
+
+        // 结构约束：水平 + 垂直
+        for (let r = 0; r < rows; r++) {
+            for (let c = 0; c < cols; c++) {
+                const p = this.grid.get(`${r}-${c}`);
+
+                // 水平约束
+                if (c < cols - 1) {
+                    const right = this.grid.get(`${r}-${c + 1}`);
+                    this.constraints.push(new DistanceConstraint(
+                        p, right, getStiffness(r)
+                    ));
+                }
+
+                // 垂直约束
+                if (r < rows - 1) {
+                    const below = this.grid.get(`${r + 1}-${c}`);
+                    this.constraints.push(new DistanceConstraint(
+                        p, below, getStiffness(r)
+                    ));
+                }
+
+                // 对角约束 (增加结构稳定性)
+                if (c < cols - 1 && r < rows - 1) {
+                    const diag = this.grid.get(`${r + 1}-${c + 1}`);
+                    this.constraints.push(new DistanceConstraint(
+                        p, diag, getStiffness(r) * 0.7
+                    ));
+                }
+                if (c > 0 && r < rows - 1) {
+                    const diag = this.grid.get(`${r + 1}-${c - 1}`);
+                    this.constraints.push(new DistanceConstraint(
+                        p, diag, getStiffness(r) * 0.7
+                    ));
+                }
+            }
+        }
+
+        // 弯曲约束：跨越粒子 (控制纸张刚度)
+        const bend = CONFIG.bendStiffness;
+        for (let r = 0; r < rows; r++) {
+            for (let c = 0; c < cols; c++) {
+                const p = this.grid.get(`${r}-${c}`);
+
+                // 水平弯曲
+                if (c < cols - 2) {
+                    const p2 = this.grid.get(`${r}-${c + 2}`);
+                    const stiff = r < CONFIG.topRowsToStiffen ? bend * 2 : bend;
+                    this.constraints.push(new DistanceConstraint(p, p2, stiff));
+                }
+
+                // 垂直弯曲
+                if (r < rows - 2) {
+                    const p2 = this.grid.get(`${r + 2}-${c}`);
+                    const stiff = r < CONFIG.topRowsToStiffen ? bend * 2 : bend;
+                    this.constraints.push(new DistanceConstraint(p, p2, stiff));
+                }
+            }
+        }
+
+        // 特殊：顶部水平约束 (确保顶行保持直线)
+        // 这一步关键！顶部粒子之间必须有非常强的水平约束
+        const topRow = 0;
+        for (let c = 0; c < cols - 1; c++) {
+            const p1 = this.grid.get(`${topRow}-${c}`);
+            const p2 = this.grid.get(`${topRow}-${c + 1}`);
+            // 额外的强约束
+            this.constraints.push(new DistanceConstraint(p1, p2, 1.0));
+        }
+
+        // 顶行到第二行的强约束 (防止下垂)
+        for (let c = 0; c < cols; c++) {
+            const p1 = this.grid.get(`0-${c}`);
+            const p2 = this.grid.get(`1-${c}`);
+            this.constraints.push(new DistanceConstraint(p1, p2, 1.0));
+        }
+    }
+
+    step(dt, gravity) {
+        const subDt = dt / CONFIG.subSteps;
+
+        for (let step = 0; step < CONFIG.subSteps; step++) {
+            // 应用重力
+            this.particles.forEach(p => {
+                if (!p.pinned) {
+                    p.addForce(gravity);
+                }
+            });
+
+            // 积分
+            this.particles.forEach(p => p.integrate(subDt));
+
+            // 求解约束
+            this.constraints.forEach(c => c.solve());
+
+            // 顶部边缘强制水平 (关键步骤)
+            this.enforceTopEdgeHorizontality();
+        }
+    }
+
+    enforceTopEdgeHorizontality() {
+        const { cols } = CONFIG;
+
+        // 计算顶部固定点的平均 Y 值
+        let avgY = 0;
+        for (let c = 0; c < cols; c++) {
+            const p = this.grid.get(`0-${c}`);
+            avgY += p.position.y;
+        }
+        avgY /= cols;
+
+        // 强制顶部粒子保持水平
+        for (let c = 0; c < cols; c++) {
+            const p = this.grid.get(`0-${c}`);
+            p.position.y = avgY;
+
+            // 确保 Z 为 0 (保持在同一平面)
+            p.position.z = 0;
+        }
+    }
+
+    findNearestParticle(point, maxDist = CONFIG.interactionRadius) {
+        let nearest = null;
+        let minDistSq = maxDist * maxDist;
+
+        this.particles.forEach(p => {
+            if (p.pinned || p.row < 1) return; // 跳过固定粒子和顶部区域
+
+            const distSq = p.position.distanceToSquared(point);
+            if (distSq < minDistSq) {
+                minDistSq = distSq;
+                nearest = p;
+            }
+        });
+
+        return nearest;
+    }
+
+    getParticleSystem() {
+        return this.particles;
+    }
+}
+
+// ============================================================
+// 小票渲染网格
+// ============================================================
+class ReceiptMesh {
+    constructor(physics) {
+        this.physics = physics;
+        this.mesh = null;
+        this.geometry = null;
+
+        this.createMesh();
+    }
+
+    createMesh() {
+        const { cols, rows } = CONFIG;
+        const particles = this.physics.getParticleSystem();
+
+        // 创建几何体
+        this.geometry = new THREE.BufferGeometry();
+
+        // 顶点
+        const positions = new Float32Array(particles.length * 3);
+        const uvs = new Float32Array(particles.length * 2);
+
+        particles.forEach((p, i) => {
+            positions[i * 3] = p.position.x;
+            positions[i * 3 + 1] = p.position.y;
+            positions[i * 3 + 2] = p.position.z;
+
+            const row = Math.floor(i / cols);
+            const col = i % cols;
+            uvs[i * 2] = col / (cols - 1);
+            uvs[i * 2 + 1] = 1 - row / (rows - 1);
+        });
+
+        this.geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        this.geometry.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+
+        // 索引
+        const indices = [];
+        for (let r = 0; r < rows - 1; r++) {
+            for (let c = 0; c < cols - 1; c++) {
+                const i = r * cols + c;
+                indices.push(i, i + 1, i + cols);
+                indices.push(i + 1, i + cols + 1, i + cols);
+            }
+        }
+        this.geometry.setIndex(indices);
+        this.geometry.computeVertexNormals();
+
+        // 创建纹理
+        const texture = this.createReceiptTexture();
+
+        // 热敏纸材质
+        const material = new THREE.MeshStandardMaterial({
+            map: texture,
+            side: THREE.DoubleSide,
+            roughness: 0.92,
+            metalness: 0.0,
+            transparent: true,
+            opacity: 0.98,
+        });
+
+        this.mesh = new THREE.Mesh(this.geometry, material);
+        this.mesh.castShadow = true;
+        this.mesh.receiveShadow = true;
+    }
+
+    createReceiptTexture() {
+        const canvas = document.createElement('canvas');
+        canvas.width = 384;
+        canvas.height = 720;
+        const ctx = canvas.getContext('2d');
+
+        // 热敏纸背景
+        ctx.fillStyle = '#f8f8f3';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        // 纸张纹理
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.015)';
+        for (let i = 0; i < 2000; i++) {
+            ctx.fillRect(
+                Math.random() * canvas.width,
+                Math.random() * canvas.height,
+                Math.random() * 1.5,
+                Math.random() * 1.5
+            );
+        }
+
+        const drawCenter = (text, y, size = 20, bold = false) => {
+            ctx.font = bold ? `bold ${size}px "Courier New"` : `${size}px "Courier New"`;
+            ctx.fillStyle = '#111';
+            ctx.textAlign = 'center';
+            ctx.fillText(text, canvas.width / 2, y);
+        };
+
+        const drawLine = (y, dashed = false) => {
+            ctx.strokeStyle = '#222';
+            ctx.lineWidth = 1;
+            ctx.setLineDash(dashed ? [4, 4] : []);
+            ctx.beginPath();
+            ctx.moveTo(20, y);
+            ctx.lineTo(canvas.width - 20, y);
+            ctx.stroke();
+            ctx.setLineDash([]);
+        };
+
+        let y = 35;
+
+        // 标题
+        ctx.save();
+        ctx.fillStyle = '#111';
+        ctx.font = 'bold 22px "Courier New"';
+        ctx.textAlign = 'center';
+        ctx.fillText('*** GPU GRAPHICS ***', canvas.width / 2, y);
+        ctx.restore();
+        y += 28;
+
+        drawCenter('图形程序员专属超市', y, 14);
+        y += 20;
+        drawCenter('TEL: 1-800-VERTEX', y, 13);
+        y += 18;
+        drawLine(y, false);
+        y += 22;
+
+        // 商品列表
+        const items = [
+            ['Vertices (顶点) x1M', '$10,000.00'],
+            ['Triangles (三角形) x500K', '$2,500.00'],
+            ['UV Coordinates xINF', 'FREE!'],
+            ['Normals (法线) x1M', '$20,000.00'],
+            ['Tangents (切线) x500K', '$7,500.00'],
+            ['Fragment Shader', '$999.99'],
+            ['Vertex Shader', '$888.88'],
+            ['Draw Calls x2000', '$50,000.00'],
+            ['Texture Memory 4GB', '$40,960.00'],
+            ['4x MSAA', '$4.00'],
+            ['Depth Buffer', '$500.00'],
+            ['Stencil Buffer', '$300.00'],
+            ['Framebuffer', '$1,200.00'],
+        ];
+
+        // 表头
+        ctx.font = 'bold 12px "Courier New"';
+        ctx.textAlign = 'left';
+        ctx.fillText('ITEM', 20, y);
+        ctx.textAlign = 'right';
+        ctx.fillText('TOTAL', canvas.width - 20, y);
+        y += 8;
+        drawLine(y);
+
+        items.forEach(([name, price]) => {
+            y += 16;
+            ctx.font = '11px "Courier New"';
+            ctx.fillStyle = '#111';
+            ctx.textAlign = 'left';
+            ctx.fillText(name, 20, y);
+            ctx.textAlign = 'right';
+            ctx.fillText(price, canvas.width - 20, y);
+        });
+
+        y += 12;
+        drawLine(y);
+        y += 22;
+
+        // 总计
+        ctx.font = 'bold 16px "Courier New"';
+        ctx.textAlign = 'left';
+        ctx.fillText('SUBTOTAL:', 20, y);
+        ctx.textAlign = 'right';
+        ctx.fillText('$135,851.87', canvas.width - 20, y);
+        y += 18;
+
+        ctx.fillStyle = '#c00';
+        ctx.fillText('GPU CYCLE TAX:', 20, y);
+        ctx.textAlign = 'right';
+        ctx.fillText('$6,792.59', canvas.width - 20, y);
+        y += 20;
+
+        ctx.font = 'bold 18px "Courier New"';
+        ctx.fillStyle = '#000';
+        ctx.textAlign = 'left';
+        ctx.fillText('TOTAL:', 20, y);
+        ctx.textAlign = 'right';
+        ctx.fillText('$142,644.46', canvas.width - 20, y);
+        y += 25;
+
+        drawLine(y, true);
+        y += 22;
+
+        // 提示信息
+        ctx.fillStyle = '#000';
+        ctx.textAlign = 'center';
+        drawCenter('** OPTIMIZATION TIPS **', y, 13, true);
+        y += 18;
+        drawCenter('Batch your draw calls!', y, 12);
+        y += 14;
+        drawCenter('Use texture atlases!', y, 12);
+        y += 14;
+        drawCenter('LOD is your friend!', y, 12);
+        y += 14;
+        drawCenter('Occlusion culling saves $$$', y, 12);
+        y += 20;
+
+        // 二维码
+        const qrSize = 50;
+        const qrX = (canvas.width - qrSize) / 2;
+        ctx.fillStyle = '#222';
+        ctx.fillRect(qrX, y, qrSize, qrSize);
+
+        ctx.fillStyle = '#f8f8f3';
+        for (let i = 0; i < 6; i++) {
+            for (let j = 0; j < 6; j++) {
+                if (Math.random() > 0.5) {
+                    ctx.fillRect(qrX + 5 + i * 7, y + 5 + j * 7, 5, 5);
+                }
+            }
+        }
+        y += qrSize + 15;
+
+        // 底部信息
+        ctx.font = '10px "Courier New"';
+        ctx.fillStyle = '#444';
+        drawCenter('No refunds for NaN values', y);
+        y += 13;
+        drawCenter('Thank you for rendering!', y);
+        y += 13;
+        drawCenter('FPS: hopefully 60', y);
+        y += 15;
+
+        // 裁剪边效果
+        ctx.strokeStyle = '#ccc';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        for (let i = 0; i < canvas.width; i += 8) {
+            ctx.moveTo(i, canvas.height - 5);
+            ctx.lineTo(i + 4, canvas.height);
+        }
+        ctx.stroke();
+
+        const texture = new THREE.CanvasTexture(canvas);
+        texture.wrapS = THREE.ClampToEdgeWrapping;
+        texture.wrapT = THREE.ClampToEdgeWrapping;
+
+        return texture;
+    }
+
+    update() {
+        const particles = this.physics.getParticleSystem();
+        const positions = this.geometry.attributes.position.array;
+
+        particles.forEach((p, i) => {
+            positions[i * 3] = p.position.x;
+            positions[i * 3 + 1] = p.position.y;
+            positions[i * 3 + 2] = p.position.z;
+        });
+
+        this.geometry.attributes.position.needsUpdate = true;
+        this.geometry.computeVertexNormals();
+    }
+
+    getMesh() {
+        return this.mesh;
+    }
+}
+
+// ============================================================
+// 应用主类
+// ============================================================
+class App {
+    constructor() {
+        this.clock = null;
+        this.scene = null;
+        this.camera = null;
+        this.renderer = null;
+        this.controls = null;
+        this.physics = null;
+        this.receiptMesh = null;
+
+        this.raycaster = new THREE.Raycaster();
+        this.mouse = new THREE.Vector2();
+        this.dragPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+        this.intersection = new THREE.Vector3();
+
+        this.selectedParticle = null;
+        this.isDragging = false;
+
+        this.init();
+    }
+
+    init() {
+        // 时钟
+        this.clock = new THREE.Clock();
+
+        // 场景
+        this.scene = new THREE.Scene();
+        this.scene.background = new THREE.Color(0xe8e8e8);
+
+        // 相机
+        this.camera = new THREE.PerspectiveCamera(
+            45,
+            window.innerWidth / window.innerHeight,
+            0.1,
+            100
+        );
+        this.camera.position.set(0, 0, 7);
+
+        // 渲染器
+        this.renderer = new THREE.WebGLRenderer({ antialias: true });
+        this.renderer.setSize(window.innerWidth, window.innerHeight);
+        this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        this.renderer.shadowMap.enabled = true;
+        this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+        document.getElementById('container').appendChild(this.renderer.domElement);
+
+        // 轨道控制器
+        this.controls = new OrbitControls(this.camera, this.renderer.domElement);
+        this.controls.enableDamping = true;
+        this.controls.dampingFactor = 0.08;
+        this.controls.maxDistance = 12;
+        this.controls.minDistance = 3;
+        this.controls.mouseButtons = {
+            LEFT: null,
+            MIDDLE: THREE.MOUSE.DOLLY,
+            RIGHT: THREE.MOUSE.ROTATE
+        };
+
+        // 灯光
+        this.setupLights();
+
+        // 背景
+        this.setupBackground();
+
+        // 物理系统
+        this.physics = new ReceiptPhysics();
+
+        // 小票网格
+        this.receiptMesh = new ReceiptMesh(this.physics);
+        this.scene.add(this.receiptMesh.getMesh());
+
+        // 事件监听
+        this.setupEvents();
+
+        // 开始动画
+        this.animate();
+    }
+
+    setupLights() {
+        // 环境光
+        const ambient = new THREE.AmbientLight(0xffffff, 0.65);
+        this.scene.add(ambient);
+
+        // 主方向光
+        const mainLight = new THREE.DirectionalLight(0xffffff, 0.9);
+        mainLight.position.set(5, 8, 6);
+        mainLight.castShadow = true;
+        mainLight.shadow.mapSize.width = 2048;
+        mainLight.shadow.mapSize.height = 2048;
+        mainLight.shadow.camera.near = 0.1;
+        mainLight.shadow.camera.far = 30;
+        mainLight.shadow.camera.left = -8;
+        mainLight.shadow.camera.right = 8;
+        mainLight.shadow.camera.top = 8;
+        mainLight.shadow.camera.bottom = -8;
+        this.scene.add(mainLight);
+
+        // 填充光
+        const fillLight = new THREE.DirectionalLight(0xffffff, 0.25);
+        fillLight.position.set(-4, 3, 4);
+        this.scene.add(fillLight);
+
+        // 背光
+        const backLight = new THREE.DirectionalLight(0xffffff, 0.15);
+        backLight.position.set(0, 2, -5);
+        this.scene.add(backLight);
+    }
+
+    setupBackground() {
+        // 阴影接收平面
+        const shadowPlane = new THREE.Mesh(
+            new THREE.PlaneGeometry(20, 20),
+            new THREE.ShadowMaterial({ opacity: 0.12 })
+        );
+        shadowPlane.position.z = -1.5;
+        shadowPlane.receiveShadow = true;
+        this.scene.add(shadowPlane);
+
+        // 装饰性网格
+        const grid = new THREE.GridHelper(12, 24, 0xdddddd, 0xeeeeee);
+        grid.rotation.x = Math.PI / 2;
+        grid.position.z = -1.4;
+        this.scene.add(grid);
+    }
+
+    setupEvents() {
+        // 窗口调整
+        window.addEventListener('resize', () => this.onResize());
+
+        // 鼠标事件
+        const canvas = this.renderer.domElement;
+        canvas.addEventListener('pointerdown', (e) => this.onPointerDown(e));
+        canvas.addEventListener('pointermove', (e) => this.onPointerMove(e));
+        canvas.addEventListener('pointerup', () => this.onPointerUp());
+        canvas.addEventListener('pointerleave', () => this.onPointerUp());
+    }
+
+    onResize() {
+        this.camera.aspect = window.innerWidth / window.innerHeight;
+        this.camera.updateProjectionMatrix();
+        this.renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+
+    onPointerDown(event) {
+        if (event.button !== 0) return;
+
+        this.mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+        this.mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+        this.raycaster.setFromCamera(this.mouse, this.camera);
+
+        // 检测与小票的交点
+        const intersects = this.raycaster.intersectObject(this.receiptMesh.getMesh());
+
+        if (intersects.length > 0) {
+            this.selectedParticle = this.physics.findNearestParticle(intersects[0].point);
+
+            if (this.selectedParticle) {
+                this.isDragging = true;
+                this.controls.enabled = false;
+
+                // 更新拖拽平面位置
+                this.dragPlane.setFromNormalAndCoplanarPoint(
+                    this.camera.getWorldDirection(new THREE.Vector3()).negate(),
+                    this.selectedParticle.position
+                );
+
+                event.preventDefault();
+            }
+        }
+    }
+
+    onPointerMove(event) {
+        if (!this.isDragging || !this.selectedParticle) return;
+
+        this.mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+        this.mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+        this.raycaster.setFromCamera(this.mouse, this.camera);
+
+        if (this.raycaster.ray.intersectPlane(this.dragPlane, this.intersection)) {
+            this.selectedParticle.position.copy(this.intersection);
+            this.selectedParticle.previous.copy(this.intersection);
+        }
+    }
+
+    onPointerUp() {
+        this.isDragging = false;
+        this.selectedParticle = null;
+        this.controls.enabled = true;
+    }
+
+    animate() {
+        requestAnimationFrame(() => this.animate());
+
+        const dt = Math.min(this.clock.getDelta(), 0.05);
+
+        // 更新物理
+        const gravity = new THREE.Vector3(0, CONFIG.gravity, 0);
+        this.physics.step(dt, gravity);
+
+        // 更新网格
+        this.receiptMesh.update();
+
+        // 更新控制器
+        this.controls.update();
+
+        // 渲染
+        this.renderer.render(this.scene, this.camera);
+
+        // 更新 FPS
+        this.updateStats();
+    }
+
+    updateStats() {
+        const fps = Math.round(1 / this.clock.getDelta() || 0);
+        document.getElementById('stats').textContent = `FPS: ${fps} | Particles: ${CONFIG.cols * CONFIG.rows}`;
+    }
+}
+
+// 启动
+new App();
+
+console.log('%c🖨️ GPU GRAPHICS 小票打印机已启动!', 'font-size: 16px; font-weight: bold; color: #c0392b;');
+console.log('%c💡 操作提示: 左键拖拽 | 右键旋转 | 滚轮缩放', 'color: #666;');

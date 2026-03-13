@@ -1,0 +1,618 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D 购物小票 - 物理模拟</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=STSong&family=Courier+Prime&display=swap');
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            overflow: hidden;
+            background: #ffffff;
+            font-family: 'Courier Prime', 'STSong', serif;
+        }
+
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            position: relative;
+        }
+
+        canvas {
+            display: block;
+        }
+
+        .tip {
+            position: fixed;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            color: #666;
+            font-size: 14px;
+            background: rgba(255,255,255,0.9);
+            padding: 10px 20px;
+            border-radius: 20px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            pointer-events: none;
+            z-index: 100;
+        }
+    </style>
+</head>
+<body>
+    <div id="canvas-container"></div>
+    <div class="tip">🖱️ 鼠标左键抓取拖拽 | 呈现真实的物理纸张体验</div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script>
+        // ============================================
+        // VERLET PHYSICS ENGINE FOR RECEIPT
+        // ============================================
+
+        class VerletParticle {
+            constructor(x, y, z, pinned = false) {
+                this.position = new THREE.Vector3(x, y, z);
+                this.previousPosition = new THREE.Vector3(x, y, z);
+                this.acceleration = new THREE.Vector3(0, 0, 0);
+                this.pinned = pinned;
+                this.mass = 1;
+            }
+
+            integrate(dt) {
+                if (this.pinned) return;
+
+                const velocity = new THREE.Vector3().subVectors(this.position, this.previousPosition);
+                velocity.multiplyScalar(0.98); // damping - mimics paper air resistance
+
+                this.previousPosition.copy(this.position);
+
+                // Verlet integration
+                this.position.add(velocity);
+                this.position.add(this.acceleration.multiplyScalar(dt * dt));
+
+                this.acceleration.set(0, 0, 0);
+            }
+
+            applyForce(force) {
+                if (!this.pinned) {
+                    this.acceleration.add(force.clone().divideScalar(this.mass));
+                }
+            }
+
+            constrainToBounds(minY) {
+                if (!this.pinned && this.position.y < minY) {
+                    this.position.y = minY;
+                }
+            }
+        }
+
+        class Constraint {
+            constructor(p1, p2, stiffness = 1.0) {
+                this.p1 = p1;
+                this.p2 = p2;
+                this.restLength = p1.position.distanceTo(p2.position);
+                this.stiffness = stiffness;
+            }
+
+            solve() {
+                const diff = new THREE.Vector3().subVectors(this.p2.position, this.p1.position);
+                const currentLength = diff.length();
+                if (currentLength === 0) return;
+
+                const correction = (currentLength - this.restLength) / currentLength;
+                const correctionVector = diff.multiplyScalar(correction * 0.5 * this.stiffness);
+
+                if (!this.p1.pinned) {
+                    this.p1.position.add(correctionVector);
+                }
+                if (!this.p2.pinned) {
+                    this.p2.position.sub(correctionVector);
+                }
+            }
+        }
+
+        class ClothSimulation {
+            constructor(width, height, segmentsX, segmentsY) {
+                this.width = width;
+                this.height = height;
+                this.segmentsX = segmentsX;
+                this.segmentsY = segmentsY;
+                this.particles = [];
+                this.constraints = [];
+
+                this.createParticles();
+                this.createConstraints();
+            }
+
+            createParticles() {
+                const spacingX = this.width / this.segmentsX;
+                const spacingY = this.height / this.segmentsY;
+
+                for (let y = 0; y <= this.segmentsY; y++) {
+                    for (let x = 0; x <= this.segmentsX; x++) {
+                        const px = (x - this.segmentsX / 2) * spacingX;
+                        const py = (this.segmentsY / 2 - y) * spacingY;
+                        const pz = 0;
+
+                        // CRITICAL: Pin ALL particles on top edge
+                        // This prevents "clothesline" effect - NO sagging in the middle
+                        const isTopEdge = y === 0;
+                        const pinned = isTopEdge;
+
+                        this.particles.push(new VerletParticle(px, py, pz, pinned));
+                    }
+                }
+            }
+
+            createConstraints() {
+                const cols = this.segmentsX + 1;
+
+                for (let y = 0; y <= this.segmentsY; y++) {
+                    for (let x = 0; x <= this.segmentsX; x++) {
+                        const index = y * cols + x;
+
+                        // Horizontal constraint
+                        if (x < this.segmentsX) {
+                            this.constraints.push(new Constraint(
+                                this.particles[index],
+                                this.particles[index + 1],
+                                1.0 // High stiffness for horizontal
+                            ));
+                        }
+
+                        // Vertical constraint
+                        if (y < this.segmentsY) {
+                            this.constraints.push(new Constraint(
+                                this.particles[index],
+                                this.particles[index + cols],
+                                0.9
+                            ));
+                        }
+
+                        // Diagonal constraints for shear stability
+                        if (x < this.segmentsX && y < this.segmentsY) {
+                            this.constraints.push(new Constraint(
+                                this.particles[index],
+                                this.particles[index + cols + 1],
+                                0.8
+                            ));
+                            this.constraints.push(new Constraint(
+                                this.particles[index + 1],
+                                this.particles[index + cols],
+                                0.8
+                            ));
+                        }
+
+                        // Extra horizontal constraint for top edge (prevents ANY sag)
+                        if (y === 0 && x < this.segmentsX) {
+                            this.constraints.push(new Constraint(
+                                this.particles[index],
+                                this.particles[index + 1],
+                                1.0 // Extra stiff for top edge horizontal
+                            ));
+                        }
+                    }
+                }
+            }
+
+            update(dt) {
+                // Apply gravity
+                const gravity = new THREE.Vector3(0, -9.8, 0);
+                for (const particle of this.particles) {
+                    particle.applyForce(gravity);
+                }
+
+                // Integrate
+                for (const particle of this.particles) {
+                    particle.integrate(dt);
+                }
+
+                // Solve constraints multiple times for stability
+                for (let i = 0; i < 4; i++) {
+                    for (const constraint of this.constraints) {
+                        constraint.solve();
+                    }
+                }
+
+                // Floor collision
+                for (const particle of this.particles) {
+                    particle.constrainToBounds(-5);
+                }
+            }
+
+            getParticle(x, y) {
+                return this.particles[y * (this.segmentsX + 1) + x];
+            }
+        }
+
+        // ============================================
+        // THREE.JS SCENE SETUP
+        // ============================================
+
+        let scene, camera, renderer;
+        let receipt, receiptGeometry, receiptMaterial;
+        let cloth;
+        let mouse, raycaster;
+        let isDragging = false;
+        let draggedParticles = [];
+        let dragPlane;
+
+        // Receipt dimensions
+        const RECEIPT_WIDTH = 3;
+        const RECEIPT_HEIGHT = 6;
+        const SEGMENTS_X = 24;
+        const SEGMENTS_Y = 40;
+
+        function init() {
+            // Scene
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0xffffff);
+
+            // Camera - isometric-ish view
+            camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+            camera.position.set(0, 2, 12);
+            camera.lookAt(0, 0, 0);
+
+            // Renderer
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            renderer.shadowMap.enabled = true;
+            renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+            document.getElementById('canvas-container').appendChild(renderer.domElement);
+
+            // Lighting - soft and natural
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+            scene.add(ambientLight);
+
+            const mainLight = new THREE.DirectionalLight(0xffffff, 0.8);
+            mainLight.position.set(5, 10, 7);
+            mainLight.castShadow = true;
+            mainLight.shadow.mapSize.width = 2048;
+            mainLight.shadow.mapSize.height = 2048;
+            mainLight.shadow.camera.near = 0.5;
+            mainLight.shadow.camera.far = 50;
+            mainLight.shadow.camera.left = -10;
+            mainLight.shadow.camera.right = 10;
+            mainLight.shadow.camera.top = 10;
+            mainLight.shadow.camera.bottom = -10;
+            scene.add(mainLight);
+
+            const fillLight = new THREE.DirectionalLight(0xfff5e6, 0.3);
+            fillLight.position.set(-5, 5, -5);
+            scene.add(fillLight);
+
+            // Ground plane for shadow
+            const groundGeometry = new THREE.PlaneGeometry(50, 50);
+            const groundMaterial = new THREE.ShadowMaterial({ opacity: 0.1 });
+            const ground = new THREE.Mesh(groundGeometry, groundMaterial);
+            ground.rotation.x = -Math.PI / 2;
+            ground.position.y = -4;
+            ground.receiveShadow = true;
+            scene.add(ground);
+
+            // Create cloth simulation
+            cloth = new ClothSimulation(RECEIPT_WIDTH, RECEIPT_HEIGHT, SEGMENTS_X, SEGMENTS_Y);
+
+            // Create receipt mesh
+            createReceiptMesh();
+
+            // Mouse interaction
+            mouse = new THREE.Vector2();
+            raycaster = new THREE.Raycaster();
+            dragPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+
+            // Events
+            renderer.domElement.addEventListener('mousedown', onMouseDown);
+            renderer.domElement.addEventListener('mousemove', onMouseMove);
+            renderer.domElement.addEventListener('mouseup', onMouseUp);
+            renderer.domElement.addEventListener('mouseleave', onMouseUp);
+            window.addEventListener('resize', onWindowResize);
+
+            // Start animation
+            animate();
+        }
+
+        function createReceiptMesh() {
+            // Create geometry from cloth particles
+            receiptGeometry = new THREE.BufferGeometry();
+
+            const vertices = new Float32Array(cloth.particles.length * 3);
+            const indices = [];
+            const uvs = new Float32Array(cloth.particles.length * 2);
+
+            const cols = SEGMENTS_X + 1;
+            const rows = SEGMENTS_Y + 1;
+
+            // Set initial positions and UVs
+            for (let i = 0; i < cloth.particles.length; i++) {
+                const x = i % cols;
+                const y = Math.floor(i / cols);
+
+                uvs[i * 2] = x / SEGMENTS_X;
+                uvs[i * 2 + 1] = 1 - (y / SEGMENTS_Y);
+            }
+
+            // Create faces
+            for (let y = 0; y < SEGMENTS_Y; y++) {
+                for (let x = 0; x < SEGMENTS_X; x++) {
+                    const a = y * cols + x;
+                    const b = y * cols + x + 1;
+                    const c = (y + 1) * cols + x;
+                    const d = (y + 1) * cols + x + 1;
+
+                    indices.push(a, b, c);
+                    indices.push(b, d, c);
+                }
+            }
+
+            receiptGeometry.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
+            receiptGeometry.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+            receiptGeometry.setIndex(indices);
+            receiptGeometry.computeVertexNormals();
+
+            // Create thermal paper texture with shopping list
+            const canvas = document.createElement('canvas');
+            canvas.width = 512;
+            canvas.height = 1024;
+            const ctx = canvas.getContext('2d');
+
+            // Thermal paper base - slightly warm white
+            ctx.fillStyle = '#faf8f5';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            // Add subtle paper texture
+            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            for (let i = 0; i < imageData.data.length; i += 4) {
+                const noise = (Math.random() - 0.5) * 8;
+                imageData.data[i] += noise;
+                imageData.data[i + 1] += noise;
+                imageData.data[i + 2] += noise;
+            }
+            ctx.putImageData(imageData, 0, 0);
+
+            // Receipt header
+            ctx.fillStyle = '#222';
+            ctx.font = 'bold 28px "Courier Prime", monospace';
+            ctx.textAlign = 'center';
+            ctx.fillText('🛒 购物小票 🧾', canvas.width / 2, 50);
+
+            ctx.font = '16px "Courier Prime", monospace';
+            ctx.fillText('━━━ 能量回收站 ━━━', canvas.width / 2, 80);
+
+            ctx.font = '14px "Courier Prime", monospace';
+            ctx.fillStyle = '#666';
+            ctx.fillText(`收银员: GPU-RTX4090`, canvas.width / 2, 105);
+            ctx.fillText(`时间: ${new Date().toLocaleString('zh-CN')}`, canvas.width / 2, 125);
+
+            // Divider
+            ctx.strokeStyle = '#333';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(30, 145);
+            ctx.lineTo(canvas.width - 30, 145);
+            ctx.stroke();
+
+            // Shopping items with 3D graphics jokes
+            const items = [
+                { name: 'Z-Buffer Overflow', price: '¥9999', emoji: '🥵' },
+                { name: 'Ray Tracing Patience', price: '¥0.01', emoji: '⏳' },
+                { name: 'Normal Map: FAiLED', price: '¥404', emoji: '🗺️' },
+                { name: 'Mipmap Level: Broke', price: '¥-1145', emoji: '💸' },
+                { name: 'Ambient Occlusion', price: '¥欠费中', emoji: '🌑' },
+                { name: 'Frame Buffer 礼物卡', price: '¥8G', emoji: '🎁' },
+                { name: 'Shader Compilation', price: '¥无限', emoji: '🔄' },
+                { name: 'LOD Level of Despair', price: '¥-999', emoji: '📉' },
+                { name: 'Deep Learning 智商', price: '¥-250', emoji: '🧠' },
+                { name: 'Phong Shading 阴影', price: '¥阴郁', emoji: '🌧️' },
+                { name: 'Vertex Shader 顶点', price: '¥崩溃', emoji: '💥' },
+                { name: 'Fragment Shader', price: '¥Fragment', emoji: '🧩' },
+            ];
+
+            ctx.font = '18px "Courier Prime", monospace';
+            let yPos = 180;
+
+            items.forEach((item, index) => {
+                ctx.fillStyle = '#222';
+                ctx.textAlign = 'left';
+                ctx.fillText(`${item.emoji} ${item.name}`, 40, yPos);
+
+                ctx.textAlign = 'right';
+                ctx.fillStyle = '#c00';
+                ctx.fillText(item.price, canvas.width - 40, yPos);
+
+                yPos += 35;
+            });
+
+            // More dividers
+            ctx.strokeStyle = '#333';
+            ctx.lineWidth = 1;
+            ctx.setLineDash([5, 5]);
+            ctx.beginPath();
+            ctx.moveTo(30, yPos);
+            ctx.lineTo(canvas.width - 30, yPos);
+            ctx.stroke();
+            ctx.setLineDash([]);
+
+            // Summary
+            yPos += 30;
+            ctx.font = 'bold 16px "Courier Prime", monospace';
+            ctx.textAlign = 'center';
+            ctx.fillStyle = '#222';
+            ctx.fillText(`共计: 破产金额`, canvas.width / 2, yPos);
+
+            yPos += 35;
+            ctx.font = 'bold 32px "Courier Prime", monospace';
+            ctx.fillStyle = '#c00';
+            ctx.fillText(`¥114514`, canvas.width / 2, yPos);
+
+            // Footer
+            yPos += 50;
+            ctx.font = '14px "Courier Prime", monospace';
+            ctx.fillStyle = '#666';
+            ctx.textAlign = 'center';
+            ctx.fillText('┌── RENDERED BY THREE.JS ──┐', canvas.width / 2, yPos);
+            ctx.fillText('│ .vertexCount = ∞        │', canvas.width / 2, yPos + 20);
+            ctx.fillText('│  .fragile = true         │', canvas.width / 2, yPos + 40);
+            ctx.fillText('│  physics: VERLET         │', canvas.width / 2, yPos + 60);
+            ctx.fillText('└─────────────────────────┘', canvas.width / 2, yPos + 80);
+
+            // QR code area (fake)
+            yPos = canvas.height - 180;
+            ctx.fillStyle = '#eee';
+            ctx.fillRect(canvas.width/2 - 50, yPos, 100, 100);
+            ctx.fillStyle = '#222';
+            ctx.font = '12px monospace';
+            ctx.fillText('■ ▪ ▫ ■ ■ ▪', canvas.width/2 - 30, yPos + 20);
+            ctx.fillText('■ ■ ■ ■ ■ □', canvas.width/2 - 30, yPos + 35);
+            ctx.fillText('□ ■ □ □ ■ ■', canvas.width/2 - 30, yPos + 50);
+            ctx.fillText('■ ■ □ ■ □ □', canvas.width/2 - 30, yPos + 65);
+            ctx.fillText('■ ■ ■ ■ ■ ■', canvas.width/2 - 30, yPos + 80);
+            ctx.font = '10px monospace';
+            ctx.fillText('扫描领取发票', canvas.width/2, yPos + 110);
+
+            // Create texture from canvas
+            const texture = new THREE.CanvasTexture(canvas);
+            texture.wrapS = THREE.ClampToEdgeWrapping;
+            texture.wrapT = THREE.ClampToEdgeWrapping;
+
+            // Thermal paper material - slight sheen like real thermal paper
+            receiptMaterial = new THREE.MeshStandardMaterial({
+                map: texture,
+                side: THREE.DoubleSide,
+                roughness: 0.7,
+                metalness: 0.02,
+                transparent: false,
+            });
+
+            receipt = new THREE.Mesh(receiptGeometry, receiptMaterial);
+            receipt.castShadow = true;
+            receipt.receiveShadow = true;
+            scene.add(receipt);
+
+            updateGeometry();
+        }
+
+        function updateGeometry() {
+            const positions = receiptGeometry.attributes.position.array;
+
+            for (let i = 0; i < cloth.particles.length; i++) {
+                positions[i * 3] = cloth.particles[i].position.x;
+                positions[i * 3 + 1] = cloth.particles[i].position.y;
+                positions[i * 3 + 2] = cloth.particles[i].position.z;
+            }
+
+            receiptGeometry.attributes.position.needsUpdate = true;
+            receiptGeometry.computeVertexNormals();
+        }
+
+        // ============================================
+        // MOUSE INTERACTION
+        // ============================================
+
+        function getMousePosition(event) {
+            const rect = renderer.domElement.getBoundingClientRect();
+            mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+            mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+        }
+
+        function onMouseDown(event) {
+            getMousePosition(event);
+            raycaster.setFromCamera(mouse, camera);
+
+            const intersects = raycaster.intersectObject(receipt);
+
+            if (intersects.length > 0) {
+                isDragging = true;
+                draggedParticles = [];
+
+                const face = intersects[0].face;
+                const intersectPoint = intersects[0].point;
+
+                // Find nearby particles and add to drag
+                const threshold = 0.5;
+                for (const particle of cloth.particles) {
+                    const dist = particle.position.distanceTo(intersectPoint);
+                    if (dist < threshold && !particle.pinned) {
+                        draggedParticles.push({
+                            particle: particle,
+                            offset: new THREE.Vector3().subVectors(particle.position, intersectPoint)
+                        });
+                    }
+                }
+
+                // Update drag plane to face camera at intersection point
+                dragPlane.setFromNormalAndCoplanarPoint(
+                    camera.getWorldDirection(new THREE.Vector3()).negate(),
+                    intersectPoint
+                );
+            }
+        }
+
+        function onMouseMove(event) {
+            if (!isDragging || draggedParticles.length === 0) return;
+
+            getMousePosition(event);
+            raycaster.setFromCamera(mouse, camera);
+
+            const intersectPoint = new THREE.Vector3();
+            raycaster.ray.intersectPlane(dragPlane, intersectPoint);
+
+            if (intersectPoint) {
+                // Move all dragged particles
+                for (const dp of draggedParticles) {
+                    const newPos = intersectPoint.clone().add(dp.offset);
+                    dp.particle.previousPosition.copy(dp.particle.position);
+                    dp.particle.position.copy(newPos);
+                }
+            }
+        }
+
+        function onMouseUp() {
+            isDragging = false;
+            draggedParticles = [];
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        // ============================================
+        // ANIMATION LOOP
+        // ============================================
+
+        let lastTime = performance.now();
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const now = performance.now();
+            let dt = (now - lastTime) / 1000;
+            lastTime = now;
+
+            // Clamp dt to prevent explosion
+            dt = Math.min(dt, 0.033);
+
+            // Update physics
+            cloth.update(dt);
+
+            // Update geometry
+            updateGeometry();
+
+            // Render
+            renderer.render(scene, camera);
+        }
+
+        // Initialize
+        init();
+    </script>
+</body>
+</html>
