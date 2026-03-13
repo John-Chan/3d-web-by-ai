@@ -4,6 +4,12 @@
 
 ## 测试方法
 
+`claude code版本`：`v2.1.74`
+
+`codex 版本`：`v0.114.0`
+
+
+
 提示词（来自网络，出处未知）
 
 ```markdown
@@ -30,14 +36,17 @@
 
 
 
-| 工具          | 模型参数                          | 模型供应商 | 工作区(文件夹)            | 结果                                    |
-| ------------- | --------------------------------- | ---------- | ------------------------- | --------------------------------------- |
-| `claude code` | `claude-opus-4-6 （high effort）` | 中转官方   | `cc-claude-opus-4-6-high` | 成功，小于1分钟，无人工参与             |
-| `codex`       | ` gpt-5.4(xhigh)`                 | 中转官方   | `codex-gpt-5_4_xhigh`     | 成功，小于1分钟，无人工参与             |
-| `claude code` | `glm-5 （high effort）`           | 硅基流动   | `cc-glm-5-high`           | 失败，大约8分钟，需要授权调用`deepwiki` |
-| `claude code` | `mimimax-m2.5 （high effort）`    | 硅基流动   | `cc-minimax-m-2_5-high`   | 成功，小于1分钟，无人工参与             |
+| 工具          | 模型参数                          | 模型供应商        | 工作区(文件夹)            | 结果                                        |
+| ------------- | --------------------------------- | ----------------- | ------------------------- | ------------------------------------------- |
+| `claude code` | `claude-opus-4-6 （high effort）` | 中转官方          | `cc-claude-opus-4-6-high` | 成功，小于1分钟，无人工参与                 |
+| `codex`       | ` gpt-5.4(xhigh)`                 | 中转官方          | `codex-gpt-5_4_xhigh`     | 成功，小于1分钟，无人工参与                 |
+| `claude code` | `glm-5 （high effort）`           | 硅基流动          | `cc-glm-5-high`           | **失败**，大约8分钟，需要授权调用`deepwiki` |
+| `claude code` | `mimimax-m2.5 （high effort）`    | 硅基流动          | `cc-minimax-m-2_5-high`   | 成功，小于1分钟，无人工参与                 |
+| `claude code` | `kimi-k2.5 （high effort）`       | 硅基流动          | `cc-kimi-k-2_5-high`      | 成功，大约5分钟，无人工参与                 |
+| `claude code` | `gpt-5.4 （high effort）`         | `sub2api`代理官方 | `cc-gpt-5_4-high`         | **失败**，大约20分钟，需要人工确认需求      |
 
 
 
-> 用浏览器打开`html`文件可以查看实际效果
+> - 用浏览器打开`html`文件可以查看实际效果
 
+个人感觉物理效果最真实的是`codex-gpt-5_4_xhigh`

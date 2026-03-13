@@ -1,0 +1,806 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D 物理小票 - Three.js Verlet Paper</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            overflow: hidden;
+            background: #f5f5f5;
+            font-family: 'Courier New', monospace;
+        }
+
+        #canvas {
+            display: block;
+            width: 100vw;
+            height: 100vh;
+        }
+
+        #info {
+            position: fixed;
+            top: 20px;
+            left: 20px;
+            background: rgba(255, 255, 255, 0.9);
+            padding: 15px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            font-size: 14px;
+            color: #333;
+            pointer-events: none;
+            max-width: 280px;
+        }
+
+        #info h3 {
+            margin-bottom: 8px;
+            color: #222;
+        }
+
+        #info p {
+            margin: 4px 0;
+            line-height: 1.4;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="canvas"></canvas>
+    <div id="info">
+        <h3>🧾 3D 物理小票</h3>
+        <p>🖱️ 左键拖拽小票任意位置</p>
+        <p>📄 体验真实纸张物理效果</p>
+        <p>🔝 顶部边缘始终固定水平</p>
+    </div>
+
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+        }
+    }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // ============================================
+        // 配置参数
+        // ============================================
+        const CONFIG = {
+            // 小票尺寸
+            width: 4,
+            height: 10,
+
+            // 粒子网格细分
+            segmentsX: 16,
+            segmentsY: 40,
+
+            // 物理参数
+            gravity: -0.015,
+            friction: 0.98,
+            stiffness: 0.5,
+            bendStiffness: 0.3,
+
+            // 约束迭代次数
+            constraintIterations: 8,
+
+            // 鼠标交互
+            mouseInfluenceRadius: 1.2,
+            mouseStrength: 0.8
+        };
+
+        // ============================================
+        // 粒子类
+        // ============================================
+        class Particle {
+            constructor(x, y, z, pinned = false) {
+                this.position = new THREE.Vector3(x, y, z);
+                this.prevPosition = new THREE.Vector3(x, y, z);
+                this.originalPosition = new THREE.Vector3(x, y, z);
+                this.pinned = pinned;
+                this.mass = 1;
+                this.acceleration = new THREE.Vector3();
+            }
+
+            update() {
+                if (this.pinned) return;
+
+                // Verlet 积分
+                const velocity = this.position.clone().sub(this.prevPosition).multiplyScalar(CONFIG.friction);
+
+                this.prevPosition.copy(this.position);
+                this.position.add(velocity).add(this.acceleration);
+
+                // 重置加速度
+                this.acceleration.set(0, 0, 0);
+            }
+
+            applyForce(force) {
+                if (this.pinned) return;
+                this.acceleration.add(force.divideScalar(this.mass));
+            }
+
+            setPosition(x, y, z) {
+                this.position.set(x, y, z);
+            }
+        }
+
+        // ============================================
+        // 距离约束
+        // ============================================
+        class DistanceConstraint {
+            constructor(p1, p2, restLength = null) {
+                this.p1 = p1;
+                this.p2 = p2;
+                this.restLength = restLength || p1.position.distanceTo(p2.position);
+            }
+
+            resolve() {
+                const diff = this.p2.position.clone().sub(this.p1.position);
+                const dist = diff.length();
+
+                if (dist === 0) return;
+
+                const correction = diff.multiplyScalar((dist - this.restLength) / dist * 0.5 * CONFIG.stiffness);
+
+                if (!this.p1.pinned) this.p1.position.add(correction);
+                if (!this.p2.pinned) this.p2.position.sub(correction);
+            }
+        }
+
+        // ============================================
+        // 弯曲约束（保持纸张平整度）
+        // ============================================
+        class BendConstraint {
+            constructor(p1, p2, p3, minAngle = Math.PI * 0.1) {
+                this.p1 = p1;
+                this.p2 = p2; // 中间点
+                this.p3 = p3;
+                this.restAngle = this.calculateAngle();
+                this.stiffness = CONFIG.bendStiffness;
+            }
+
+            calculateAngle() {
+                const v1 = this.p1.position.clone().sub(this.p2.position).normalize();
+                const v2 = this.p3.position.clone().sub(this.p2.position).normalize();
+                return Math.acos(Math.max(-1, Math.min(1, v1.dot(v2))));
+            }
+
+            resolve() {
+                const currentAngle = this.calculateAngle();
+                const diff = currentAngle - this.restAngle;
+
+                if (Math.abs(diff) < 0.01) return;
+
+                const v1 = this.p1.position.clone().sub(this.p2.position);
+                const v2 = this.p3.position.clone().sub(this.p2.position);
+
+                const len1 = v1.length();
+                const len2 = v2.length();
+
+                if (len1 === 0 || len2 === 0) return;
+
+                // 简单的弯曲阻力 - 将中间点向两侧推
+                const correction = diff * this.stiffness * 0.1;
+                const dir1 = v1.normalize();
+                const dir2 = v2.normalize();
+
+                const correction1 = dir2.clone().multiplyScalar(correction * len1 * 0.5);
+                const correction2 = dir1.clone().multiplyScalar(correction * len2 * 0.5);
+
+                if (!this.p2.pinned) {
+                    this.p2.position.sub(correction1).sub(correction2);
+                }
+            }
+        }
+
+        // ============================================
+        // 纸张模拟系统
+        // ============================================
+        class PaperSimulation {
+            constructor() {
+                this.particles = [];
+                this.constraints = [];
+                this.bendConstraints = [];
+                this.width = CONFIG.width;
+                this.height = CONFIG.height;
+                this.segmentsX = CONFIG.segmentsX;
+                this.segmentsY = CONFIG.segmentsY;
+
+                this.initParticles();
+                this.initConstraints();
+            }
+
+            initParticles() {
+                const startX = -this.width / 2;
+                const startY = this.height / 2;
+
+                for (let y = 0; y <= this.segmentsY; y++) {
+                    const row = [];
+                    const py = startY - (y / this.segmentsY) * this.height;
+
+                    for (let x = 0; x <= this.segmentsX; x++) {
+                        const px = startX + (x / this.segmentsX) * this.width;
+
+                        // 顶部整条边缘固定 - 这是关键！
+                        const pinned = (y === 0);
+
+                        const particle = new Particle(px, py, 0, pinned);
+                        row.push(particle);
+                    }
+                    this.particles.push(row);
+                }
+            }
+
+            initConstraints() {
+                // 结构约束（水平和垂直）
+                for (let y = 0; y <= this.segmentsY; y++) {
+                    for (let x = 0; x <= this.segmentsX; x++) {
+                        const p = this.particles[y][x];
+
+                        // 水平约束
+                        if (x < this.segmentsX) {
+                            this.constraints.push(new DistanceConstraint(p, this.particles[y][x + 1]));
+                        }
+
+                        // 垂直约束
+                        if (y < this.segmentsY) {
+                            this.constraints.push(new DistanceConstraint(p, this.particles[y + 1][x]));
+                        }
+                    }
+                }
+
+                // 对角约束（剪切阻力）
+                for (let y = 0; y < this.segmentsY; y++) {
+                    for (let x = 0; x < this.segmentsX; x++) {
+                        const p = this.particles[y][x];
+                        this.constraints.push(new DistanceConstraint(p, this.particles[y + 1][x + 1]));
+                        this.constraints.push(new DistanceConstraint(this.particles[y][x + 1], this.particles[y + 1][x]));
+                    }
+                }
+
+                // 弯曲约束（保持纸张相对平整）
+                for (let y = 0; y < this.segmentsY; y++) {
+                    for (let x = 0; x <= this.segmentsX; x++) {
+                        if (y < this.segmentsY - 1) {
+                            this.bendConstraints.push(new BendConstraint(
+                                this.particles[y][x],
+                                this.particles[y + 1][x],
+                                this.particles[y + 2][x]
+                            ));
+                        }
+                    }
+                }
+            }
+
+            update() {
+                // 应用重力
+                const gravity = new THREE.Vector3(0, CONFIG.gravity, 0);
+                for (let y = 0; y <= this.segmentsY; y++) {
+                    for (let x = 0; x <= this.segmentsX; x++) {
+                        this.particles[y][x].applyForce(gravity);
+                        this.particles[y][x].update();
+                    }
+                }
+
+                // 求解约束（多次迭代提高稳定性）
+                for (let i = 0; i < CONFIG.constraintIterations; i++) {
+                    this.constraints.forEach(c => c.resolve());
+                    this.bendConstraints.forEach(c => c.resolve());
+                }
+            }
+
+            getParticleAt(x, y) {
+                if (y >= 0 && y <= this.segmentsY && x >= 0 && x <= this.segmentsX) {
+                    return this.particles[y][x];
+                }
+                return null;
+            }
+
+            getAllParticles() {
+                const all = [];
+                for (let y = 0; y <= this.segmentsY; y++) {
+                    for (let x = 0; x <= this.segmentsX; x++) {
+                        all.push({
+                            particle: this.particles[y][x],
+                            x, y
+                        });
+                    }
+                }
+                return all;
+            }
+        }
+
+        // ============================================
+        // 创建小票纹理
+        // ============================================
+        function createReceiptTexture() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 512;
+            canvas.height = 1024;
+            const ctx = canvas.getContext('2d');
+
+            // 热敏纸背景
+            ctx.fillStyle = '#faf8f5';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            // 纸张纹理噪点
+            for (let i = 0; i < 5000; i++) {
+                ctx.fillStyle = `rgba(0,0,0,${Math.random() * 0.02})`;
+                ctx.fillRect(Math.random() * canvas.width, Math.random() * canvas.height, 1, 1);
+            }
+
+            // 顶部锯齿边缘
+            ctx.fillStyle = '#f5f5f5';
+            for (let i = 0; i < canvas.width; i += 8) {
+                ctx.beginPath();
+                ctx.moveTo(i, 0);
+                ctx.lineTo(i + 4, 12);
+                ctx.lineTo(i + 8, 0);
+                ctx.fill();
+            }
+
+            let y = 60;
+
+            // 商店标题
+            ctx.fillStyle = '#1a1a1a';
+            ctx.font = 'bold 32px "Courier New", monospace';
+            ctx.textAlign = 'center';
+            ctx.fillText('3D GRAPHICS MART', canvas.width / 2, y);
+            y += 35;
+
+            ctx.font = '18px "Courier New", monospace';
+            ctx.fillText('Your Daily Dose of Polygons', canvas.width / 2, y);
+            y += 50;
+
+            // 分隔线
+            ctx.strokeStyle = '#333';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(40, y);
+            ctx.lineTo(canvas.width - 40, y);
+            ctx.stroke();
+            y += 40;
+
+            // 收据信息
+            ctx.font = '16px "Courier New", monospace';
+            ctx.textAlign = 'left';
+            ctx.fillText(`DATE: 2026-03-13`, 50, y);
+            y += 25;
+            ctx.fillText(`TIME: ${new Date().toLocaleTimeString()}`, 50, y);
+            y += 25;
+            ctx.fillText(`RECEIPT: #WEBGL-8888`, 50, y);
+            y += 25;
+            ctx.fillText(`CASHIER: Mr. Shader`, 50, y);
+            y += 50;
+
+            // 分隔线
+            ctx.beginPath();
+            ctx.moveTo(40, y - 15);
+            ctx.lineTo(canvas.width - 40, y - 15);
+            ctx.setLineDash([5, 5]);
+            ctx.stroke();
+            ctx.setLineDash([]);
+
+            // 商品列表 - 搞笑的 3D 图形术语
+            const items = [
+                { name: 'Normal Map Powder', qty: 2, price: 12.99 },
+                { name: 'Ambient Occlusion Jam', qty: 1, price: 24.50 },
+                { name: 'Ray Tracing Light', qty: 3, price: 89.99 },
+                { name: 'Bloom Effect Syrup', qty: 1, price: 15.00 },
+                { name: 'Vertex Shader Chips', qty: 5, price: 8.50 },
+                { name: 'PBR Material Sauce', qty: 2, price: 18.75 },
+                { name: 'SSAO Seasoning', qty: 1, price: 32.00 },
+                { name: 'HDR Skybox Water', qty: 6, price: 6.66 },
+                { name: 'Tessellation Noodles', qty: 1, price: 45.00 },
+                { name: 'Volumetric Fog Milk', qty: 2, price: 11.25 },
+                { name: 'Displacement Map Rice', qty: 1, price: 28.90 },
+                { name: 'Shadow Map Coffee', qty: 2, price: 7.50 },
+                { name: 'Blinn-Phong Butter', qty: 1, price: 9.99 },
+                { name: 'Mesh Optimization', qty: 1, price: 99.99 },
+                { name: 'Subsurface Scattering', qty: 1, price: 55.00 },
+            ];
+
+            ctx.font = 'bold 16px "Courier New", monospace';
+            ctx.fillText('ITEM', 50, y);
+            ctx.fillText('QTY', 300, y);
+            ctx.fillText('PRICE', 400, y);
+            y += 30;
+
+            ctx.font = '16px "Courier New", monospace';
+            let subtotal = 0;
+
+            items.forEach(item => {
+                const total = item.qty * item.price;
+                subtotal += total;
+
+                // 截断长名称
+                let displayName = item.name;
+                if (displayName.length > 22) displayName = displayName.slice(0, 22);
+
+                ctx.fillText(displayName, 50, y);
+                ctx.fillText(item.qty.toString(), 310, y);
+                ctx.fillText('$' + item.price.toFixed(2), 400, y);
+                y += 26;
+            });
+
+            y += 20;
+
+            // 分隔线
+            ctx.beginPath();
+            ctx.moveTo(40, y - 10);
+            ctx.lineTo(canvas.width - 40, y - 10);
+            ctx.stroke();
+
+            // 总计
+            const tax = subtotal * 0.08;
+            const total = subtotal + tax;
+
+            ctx.font = 'bold 18px "Courier New", monospace';
+            ctx.textAlign = 'right';
+            ctx.fillText(`SUBTOTAL: $${subtotal.toFixed(2)}`, canvas.width - 50, y + 25);
+            ctx.fillText(`TAX (8%): $${tax.toFixed(2)}`, canvas.width - 50, y + 50);
+
+            ctx.font = 'bold 28px "Courier New", monospace';
+            ctx.fillText(`TOTAL: $${total.toFixed(2)}`, canvas.width - 50, y + 90);
+
+            // 底部锯齿
+            y = canvas.height - 20;
+            ctx.fillStyle = '#f5f5f5';
+            for (let i = 0; i < canvas.width; i += 8) {
+                ctx.beginPath();
+                ctx.moveTo(i, canvas.height);
+                ctx.lineTo(i + 4, y);
+                ctx.lineTo(i + 8, canvas.height);
+                ctx.fill();
+            }
+
+            // 底部文字
+            ctx.fillStyle = '#1a1a1a';
+            ctx.font = '16px "Courier New", monospace';
+            ctx.textAlign = 'center';
+            ctx.fillText('THANK YOU FOR RENDERING!', canvas.width / 2, canvas.height - 50);
+            ctx.font = '14px "Courier New", monospace';
+            ctx.fillText('Visit us at: www.webgl-mart.gpu', canvas.width / 2, canvas.height - 28);
+
+            return new THREE.CanvasTexture(canvas);
+        }
+
+        // ============================================
+        // 创建法线贴图（纸张质感）
+        // ============================================
+        function createPaperNormalMap() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 256;
+            canvas.height = 256;
+            const ctx = canvas.getContext('2d');
+
+            // 基础法线颜色
+            ctx.fillStyle = '#8080ff';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            // 添加细微噪点模拟纸张纹理
+            for (let i = 0; i < 3000; i++) {
+                const intensity = Math.floor(Math.random() * 20);
+                const r = 128 + (Math.random() - 0.5) * intensity;
+                const g = 128 + (Math.random() - 0.5) * intensity;
+                const b = 255;
+                ctx.fillStyle = `rgb(${r},${g},${b})`;
+                ctx.fillRect(Math.random() * canvas.width, Math.random() * canvas.height, 2, 2);
+            }
+
+            const texture = new THREE.CanvasTexture(canvas);
+            texture.wrapS = THREE.RepeatWrapping;
+            texture.wrapT = THREE.RepeatWrapping;
+            texture.repeat.set(2, 4);
+            return texture;
+        }
+
+        // ============================================
+        // 主程序
+        // ============================================
+        const canvas = document.getElementById('canvas');
+
+        // 场景
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0xf0f0f0);
+        scene.fog = new THREE.Fog(0xf0f0f0, 10, 50);
+
+        // 相机
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 0, 20);
+
+        // 渲染器
+        const renderer = new THREE.WebGLRenderer({
+            canvas,
+            antialias: true,
+            alpha: true
+        });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+        // 控制器
+        const controls = new OrbitControls(camera, canvas);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.minDistance = 10;
+        controls.maxDistance = 40;
+        controls.maxPolarAngle = Math.PI * 0.8;
+
+        // 灯光
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(5, 10, 8);
+        dirLight.castShadow = true;
+        dirLight.shadow.mapSize.width = 2048;
+        dirLight.shadow.mapSize.height = 2048;
+        dirLight.shadow.camera.near = 0.1;
+        dirLight.shadow.camera.far = 50;
+        dirLight.shadow.bias = -0.001;
+        scene.add(dirLight);
+
+        const backLight = new THREE.DirectionalLight(0xffffff, 0.3);
+        backLight.position.set(-5, 5, -5);
+        scene.add(backLight);
+
+        // 点光源增加质感
+        const pointLight = new THREE.PointLight(0xffeebb, 0.5, 20);
+        pointLight.position.set(3, 5, 5);
+        scene.add(pointLight);
+
+        // ============================================
+        // 创建纸张模拟
+        // ============================================
+        const paperSim = new PaperSimulation();
+
+        // 几何体
+        const geometry = new THREE.PlaneGeometry(
+            CONFIG.width,
+            CONFIG.height,
+            CONFIG.segmentsX,
+            CONFIG.segmentsY
+        );
+
+        // 材质
+        const receiptTexture = createReceiptTexture();
+        const normalMap = createPaperNormalMap();
+
+        const material = new THREE.MeshPhysicalMaterial({
+            map: receiptTexture,
+            normalMap: normalMap,
+            normalScale: new THREE.Vector2(0.3, 0.3),
+            color: 0xffffff,
+            roughness: 0.7,
+            metalness: 0.0,
+            clearcoat: 0.1,
+            clearcoatRoughness: 0.4,
+            side: THREE.DoubleSide,
+            transparent: true,
+            opacity: 0.98
+        });
+
+        const receiptMesh = new THREE.Mesh(geometry, material);
+        receiptMesh.castShadow = true;
+        receiptMesh.receiveShadow = true;
+        scene.add(receiptMesh);
+
+        // 顶部固定杆（视觉提示）
+        const rodGeometry = new THREE.CylinderGeometry(0.08, 0.08, CONFIG.width + 0.5, 16);
+        const rodMaterial = new THREE.MeshStandardMaterial({
+            color: 0x888888,
+            metalness: 0.8,
+            roughness: 0.2
+        });
+        const rod = new THREE.Mesh(rodGeometry, rodMaterial);
+        rod.rotation.z = Math.PI / 2;
+        rod.position.set(0, CONFIG.height / 2 + 0.1, 0);
+        rod.castShadow = true;
+        scene.add(rod);
+
+        // ============================================
+        // 鼠标交互
+        // ============================================
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+        const worldMouse = new THREE.Vector3();
+
+        let isDragging = false;
+        let draggedParticles = [];
+
+        // 隐形碰撞平面用于鼠标追踪
+        const dragPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+
+        function updateMousePosition(clientX, clientY) {
+            mouse.x = (clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(clientY / window.innerHeight) * 2 + 1;
+        }
+
+        function getMouseWorldPosition() {
+            raycaster.setFromCamera(mouse, camera);
+            const target = new THREE.Vector3();
+            raycaster.ray.intersectPlane(dragPlane, target);
+            return target;
+        }
+
+        function findNearestParticle(worldPos) {
+            let nearest = null;
+            let minDist = Infinity;
+
+            paperSim.getAllParticles().forEach(({ particle }) => {
+                const dist = particle.position.distanceTo(worldPos);
+                if (dist < minDist && dist < CONFIG.mouseInfluenceRadius) {
+                    minDist = dist;
+                    nearest = particle;
+                }
+            });
+
+            return nearest;
+        }
+
+        function getParticlesInRadius(centerPos, radius) {
+            const particles = [];
+            paperSim.getAllParticles().forEach(({ particle }) => {
+                const dist = particle.position.distanceTo(centerPos);
+                if (dist < radius) {
+                    particles.push({
+                        particle,
+                        weight: 1 - (dist / radius)
+                    });
+                }
+            });
+            return particles;
+        }
+
+        // 鼠标事件
+        canvas.addEventListener('mousedown', (e) => {
+            if (e.button !== 0) return;
+
+            updateMousePosition(e.clientX, e.clientY);
+            raycaster.setFromCamera(mouse, camera);
+
+            const intersects = raycaster.intersectObject(receiptMesh);
+            if (intersects.length > 0) {
+                isDragging = true;
+                controls.enabled = false;
+
+                const point = intersects[0].point;
+                dragPlane.normal.copy(camera.position).sub(point).normalize();
+
+                draggedParticles = getParticlesInRadius(point, CONFIG.mouseInfluenceRadius);
+            }
+        });
+
+        canvas.addEventListener('mousemove', (e) => {
+            updateMousePosition(e.clientX, e.clientY);
+
+            if (isDragging && draggedParticles.length > 0) {
+                const targetPos = getMouseWorldPosition();
+                if (targetPos) {
+                    draggedParticles.forEach(({ particle, weight }) => {
+                        if (!particle.pinned) {
+                            const force = targetPos.clone().sub(particle.position);
+                            particle.position.add(force.multiplyScalar(CONFIG.mouseStrength * weight));
+                            particle.prevPosition.copy(particle.position);
+                        }
+                    });
+                }
+            }
+        });
+
+        canvas.addEventListener('mouseup', () => {
+            isDragging = false;
+            draggedParticles = [];
+            controls.enabled = true;
+        });
+
+        canvas.addEventListener('mouseleave', () => {
+            isDragging = false;
+            draggedParticles = [];
+            controls.enabled = true;
+        });
+
+        // 触摸支持
+        canvas.addEventListener('touchstart', (e) => {
+            e.preventDefault();
+            const touch = e.touches[0];
+            updateMousePosition(touch.clientX, touch.clientY);
+            raycaster.setFromCamera(mouse, camera);
+
+            const intersects = raycaster.intersectObject(receiptMesh);
+            if (intersects.length > 0) {
+                isDragging = true;
+                controls.enabled = false;
+                const point = intersects[0].point;
+                dragPlane.normal.copy(camera.position).sub(point).normalize();
+                draggedParticles = getParticlesInRadius(point, CONFIG.mouseInfluenceRadius);
+            }
+        }, { passive: false });
+
+        canvas.addEventListener('touchmove', (e) => {
+            e.preventDefault();
+            if (!isDragging) return;
+
+            const touch = e.touches[0];
+            updateMousePosition(touch.clientX, touch.clientY);
+
+            const targetPos = getMouseWorldPosition();
+            if (targetPos) {
+                draggedParticles.forEach(({ particle, weight }) => {
+                    if (!particle.pinned) {
+                        const force = targetPos.clone().sub(particle.position);
+                        particle.position.add(force.multiplyScalar(CONFIG.mouseStrength * weight));
+                        particle.prevPosition.copy(particle.position);
+                    }
+                });
+            }
+        }, { passive: false });
+
+        canvas.addEventListener('touchend', () => {
+            isDragging = false;
+            draggedParticles = [];
+            controls.enabled = true;
+        });
+
+        // ============================================
+        // 更新几何体顶点
+        // ============================================
+        function updateGeometry() {
+            const positions = geometry.attributes.position.array;
+
+            for (let y = 0; y <= CONFIG.segmentsY; y++) {
+                for (let x = 0; x <= CONFIG.segmentsX; x++) {
+                    const particle = paperSim.particles[y][x];
+                    const idx = (y * (CONFIG.segmentsX + 1) + x) * 3;
+
+                    positions[idx] = particle.position.x;
+                    positions[idx + 1] = particle.position.y;
+                    positions[idx + 2] = particle.position.z;
+                }
+            }
+
+            geometry.attributes.position.needsUpdate = true;
+            geometry.computeVertexNormals();
+        }
+
+        // ============================================
+        // 动画循环
+        // ============================================
+        function animate() {
+            requestAnimationFrame(animate);
+
+            // 更新物理
+            paperSim.update();
+
+            // 同步到几何体
+            updateGeometry();
+
+            // 更新控制器
+            controls.update();
+
+            // 渲染
+            renderer.render(scene, camera);
+        }
+
+        // 窗口大小调整
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // 开始动画
+        animate();
+    </script>
+</body>
+</html>
